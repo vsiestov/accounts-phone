@@ -88,6 +88,21 @@ Accounts._checkPhonePassword = function (user, password) {
 
     return result;
 };
+
+Accounts._checkPassword = function (user, password) {
+    var result = {
+        userId: user._id
+    };
+
+    password = getPasswordString(password);
+
+    if (! bcryptCompare(password, user.services.password.bcrypt)) {
+        result.error = new Meteor.Error(403, "Incorrect password");
+    }
+
+    return result;
+};
+
 var checkPassword = Accounts._checkPhonePassword;
 
 ///
@@ -103,6 +118,10 @@ var selectorFromUserQuery = function (user) {
         return {_id: user.id};
     else if (user.phone)
         return {'phone.number': user.phone};
+    else if (user.email)
+        return {'emails.address': {
+            $in: [user.email]
+        }};
     throw new Error("shouldn't happen (validation missed something)");
 };
 
@@ -125,7 +144,8 @@ var NonEmptyString = Match.Where(function (x) {
 var userQueryValidator = Match.Where(function (user) {
     check(user, {
         id   : Match.Optional(NonEmptyString),
-        phone: Match.Optional(NonEmptyString)
+        phone: Match.Optional(NonEmptyString),
+        email: Match.Optional(NonEmptyString)
     });
     if (_.keys(user).length !== 1)
         throw new Match.Error("User property must have exactly one field");
@@ -155,6 +175,12 @@ Accounts.registerLoginHandler("phone", function (options) {
     if (!options.password || options.srp)
         return undefined; // don't handle
 
+    // console.log('check auth or reg', {
+    //     user: userQueryValidator,
+    //     password: passwordValidator
+    // });
+
+
     check(options, {
         user    : userQueryValidator,
         password: passwordValidator
@@ -162,40 +188,83 @@ Accounts.registerLoginHandler("phone", function (options) {
 
     var user = findUserFromUserQuery(options.user);
 
-    if (!user.services || !user.services.phone || !(user.services.phone.bcrypt || user.services.phone.srp))
+    console.log(user);
+
+    if (!user.services ||
+        (
+            (!user.services.phone || !(user.services.phone.bcrypt || user.services.phone.srp)) &&
+            (!user.services.password || !(user.services.password.bcrypt || user.services.password.srp))
+        )
+    )
         throw new Meteor.Error(403, "User has no password set");
 
-    if (!user.services.phone.bcrypt) {
-        if (typeof options.password === "string") {
-            // The client has presented a plaintext password, and the user is
-            // not upgraded to bcrypt yet. We don't attempt to tell the client
-            // to upgrade to bcrypt, because it might be a standalone DDP
-            // client doesn't know how to do such a thing.
-            var verifier = user.services.phone.srp;
-            var newVerifier = SRP.generateVerifier(options.password, {
-                identity: verifier.identity, salt: verifier.salt});
+    if (user.services.phone) {
+        if (!user.services.phone.bcrypt) {
 
-            if (verifier.verifier !== newVerifier.verifier) {
-                return {
-                    userId: user._id,
-                    error : new Meteor.Error(403, "Incorrect password")
-                };
+            if (typeof options.password === "string") {
+                // The client has presented a plaintext password, and the user is
+                // not upgraded to bcrypt yet. We don't attempt to tell the client
+                // to upgrade to bcrypt, because it might be a standalone DDP
+                // client doesn't know how to do such a thing.
+                var verifier = user.services.phone.srp;
+                var newVerifier = SRP.generateVerifier(options.password, {
+                    identity: verifier.identity, salt: verifier.salt});
+
+                if (verifier.verifier !== newVerifier.verifier) {
+                    return {
+                        userId: user._id,
+                        error : new Meteor.Error(403, "Incorrect password")
+                    };
+                }
+
+                return {userId: user._id};
+            } else {
+                // Tell the client to use the SRP upgrade process.
+                throw new Meteor.Error(400, "old password format", EJSON.stringify({
+                    format  : 'srp',
+                    identity: user.services.phone.srp.identity
+                }));
             }
-
-            return {userId: user._id};
-        } else {
-            // Tell the client to use the SRP upgrade process.
-            throw new Meteor.Error(400, "old password format", EJSON.stringify({
-                format  : 'srp',
-                identity: user.services.phone.srp.identity
-            }));
         }
+
+        return checkPassword(
+            user,
+            options.password
+        );
+    } else if (user.services.password) {
+        if (!user.services.password.bcrypt) {
+            if (typeof options.password === "string") {
+                // The client has presented a plaintext password, and the user is
+                // not upgraded to bcrypt yet. We don't attempt to tell the client
+                // to upgrade to bcrypt, because it might be a standalone DDP
+                // client doesn't know how to do such a thing.
+                var verifier = user.services.password.srp;
+                var newVerifier = SRP.generateVerifier(options.password, {
+                    identity: verifier.identity, salt: verifier.salt});
+
+                if (verifier.verifier !== newVerifier.verifier) {
+                    return {
+                        userId: user._id,
+                        error: new Meteor.Error(403, "Incorrect password")
+                    };
+                }
+
+                return {userId: user._id};
+            } else {
+                // Tell the client to use the SRP upgrade process.
+                throw new Meteor.Error(400, "old password format", EJSON.stringify({
+                    format: 'srp',
+                    identity: user.services.password.srp.identity
+                }));
+            }
+        }
+
+        return Accounts._checkPassword(
+            user,
+            options.password
+        );
     }
 
-    return checkPassword(
-        user,
-        options.password
-    );
 });
 
 // Handler to login using the SRP upgrade path. To use this login
@@ -227,8 +296,8 @@ Accounts.registerLoginHandler("phone", function (options) {
 
     // Check to see if another simultaneous login has already upgraded
     // the user record to bcrypt.
-    if (user.services && user.services.phone &&
-        user.services.phone.bcrypt)
+    if (user.services && (user.services.phone &&
+        user.services.phone.bcrypt || user.services.password && user.services.password.bcrypt))
         return checkPassword(user, options.password);
 
     if (!(user.services && user.services.phone
@@ -708,4 +777,3 @@ var getRandomCode = function (length) {
 var getRandomDigit = function () {
     return Math.floor((Math.random() * 9) + 1);
 }
-
